@@ -58,8 +58,22 @@ declare -a FORCED_PORTS=()
 
 die() {
     printf '\nERROR: %s\n' "$*" >&2
+    echo
     exit 1
 }
+
+unexpected_error() {
+    local exit_code="$1"
+    local line_number="$2"
+    local failed_command="$3"
+
+    printf '\nERROR: Unexpected failure at line %s (exit %s): %s\n' \
+        "$line_number" "$exit_code" "$failed_command" >&2
+    echo
+    exit "$exit_code"
+}
+
+trap 'unexpected_error "$?" "$LINENO" "$BASH_COMMAND"' ERR
 
 warn() {
     printf '\nWARNING: %s\n' "$*" >&2
@@ -75,6 +89,7 @@ yes_answer() {
 
 usage() {
     cat <<EOF
+
 Usage:
   sudo ./$PROGRAM_NAME --mode install
   sudo ./$PROGRAM_NAME --mode cert
@@ -82,16 +97,15 @@ Usage:
 
 Modes:
   --mode install       Install or reconfigure Caddy for Open WebUI
-  --mode cert          Renew the fallback and change HTTPS certificate mode
-  --mode certificate   Same as --mode cert
+  --mode cert          Change HTTPS certificate mode or renew the internal certificate
   -h, --help           Show this help
 
 This script is interactive. With no options it only displays this help.
 
 Install mode wizard:
   1. Selects active LAN IPv4 interfaces and discovers reverse hostnames.
-  2. Ensures an internal self-signed fallback certificate exists.
-  3. Configures HTTPS and either the fallback or a supplied certificate/key.
+  2. Generates an internal self-signed certificate when that mode is selected.
+  3. Configures HTTPS with either the internal or a supplied certificate/key.
   4. Optionally configures a separate HTTP listener.
   5. Installs or updates Caddy and certifies both proxy and direct access.
   6. Prints every usable IP-address and discovered-hostname URL.
@@ -99,16 +113,19 @@ Install mode wizard:
 Certificate mode requires an existing project-managed Caddy proxy. It preserves
 the LAN bindings, ports, upstream, and HTTP settings. It only renews/selects the
 HTTPS certificate, updates the managed route, and restarts and verifies Caddy.
+
 EOF
 }
 
 cancel() {
     printf '\nCancelled. No Caddy configuration was changed.\n'
+    echo
     exit 0
 }
 
 if (( $# == 0 )); then
     usage
+    echo
     exit 0
 fi
 
@@ -122,6 +139,7 @@ while (( $# > 0 )); do
             ;;
         -h|--help)
             usage
+            echo
             exit 0
             ;;
         *)
@@ -214,6 +232,10 @@ load_previous_defaults() {
 
     ip_csv="$(read_conf_value "$STATE_FILE" SELECTED_IPS)"
     interface_csv="$(read_conf_value "$STATE_FILE" SELECTED_INTERFACES)"
+    # Older phase-05 releases wrote comma-separated values with printf %q,
+    # which escaped each comma. Decode those records during migration.
+    ip_csv="${ip_csv//\\,/,}"
+    interface_csv="${interface_csv//\\,/,}"
     if [[ -n "$ip_csv" ]]; then
         IFS=',' read -r -a SELECTED_IPS <<< "$ip_csv"
     fi
@@ -234,6 +256,7 @@ load_previous_defaults() {
         SELECTED_HOSTNAMES+=('')
     done
     host_pairs="$(read_conf_value "$STATE_FILE" REVERSE_HOSTNAMES)"
+    host_pairs="${host_pairs//\\,/,}"
     IFS=',' read -r -a saved_pairs <<< "$host_pairs"
     for pair in "${saved_pairs[@]}"; do
         ip_address="${pair%%=*}"
@@ -248,16 +271,20 @@ load_previous_defaults() {
 
     DISCOVERED_HOSTNAMES=()
     for hostname_value in "${SELECTED_HOSTNAMES[@]}"; do
-        [[ -n "$hostname_value" ]] && DISCOVERED_HOSTNAMES+=("$hostname_value")
+        if [[ -n "$hostname_value" ]]; then
+            DISCOVERED_HOSTNAMES+=("$hostname_value")
+        fi
     done
+
+    return 0
 }
 
 verify_prerequisites() {
     local command_name
-    local required_commands='awk cmp curl getent grep openssl sed sha256sum'
+    local required_commands='awk cmp curl dirname getent grep ip openssl sed sha256sum sort tr'
 
     if [[ "$MODE" == 'install' ]]; then
-        required_commands+=' ip ss'
+        required_commands+=' ss'
     fi
     for command_name in $required_commands; do
         command -v "$command_name" >/dev/null 2>&1 ||
@@ -444,7 +471,7 @@ discover_reverse_hostnames() {
     for ip_address in "${SELECTED_IPS[@]}"; do
         hostname_value="$(
             getent hosts "$ip_address" 2>/dev/null |
-                awk -v wanted="$ip_address" '$1 == wanted {print $2; exit}' || true
+                awk -v wanted="$ip_address" '$1 == wanted {print $2; echo; exit}' || true
         )"
         hostname_value="${hostname_value%.}"
 
@@ -471,10 +498,10 @@ certificate_covers_selected_names() {
     [[ -s "$certificate" ]] || return 1
     openssl x509 -in "$certificate" -noout -checkend 2592000 >/dev/null 2>&1 || return 1
     for ip_address in "${SELECTED_IPS[@]}"; do
-        openssl x509 -in "$certificate" -noout -checkip "$ip_address" >/dev/null 2>&1 || return 1
+        certificate_covers_ip "$certificate" "$ip_address" || return 1
     done
     for hostname_value in "${DISCOVERED_HOSTNAMES[@]}"; do
-        openssl x509 -in "$certificate" -noout -checkhost "$hostname_value" >/dev/null 2>&1 || return 1
+        certificate_covers_hostname "$certificate" "$hostname_value" || return 1
     done
     return 0
 }
@@ -488,7 +515,7 @@ generate_fallback_certificate() {
     local san_list=''
     local temp_dir
 
-    info "Ensuring the internal self-signed fallback certificate"
+    info "Preparing the active internal self-signed certificate"
     install -d -o root -g root -m 0700 "$CERT_DIR"
 
     if ! openssl x509 -in "$LOCAL_CA_CERT" -noout -checkend 2592000 >/dev/null 2>&1 ||
@@ -510,7 +537,7 @@ generate_fallback_certificate() {
 
     if [[ "$force_renewal" == 'yes' ]]; then
         rm -f -- "$FALLBACK_CERT" "$FALLBACK_LEAF_CERT" "$FALLBACK_KEY"
-        printf 'Renewing the fallback server certificate.\n'
+        printf 'Renewing the internal self-signed server certificate.\n'
     fi
 
     if certificate_covers_selected_names "$FALLBACK_LEAF_CERT" &&
@@ -521,7 +548,7 @@ generate_fallback_certificate() {
                 > "$FALLBACK_CERT"
             CERT_CHANGED='yes'
         fi
-        printf 'Existing fallback certificate already covers the selected addresses and hostnames.\n'
+        printf 'Existing internal self-signed certificate already covers the selected addresses and hostnames.\n'
         return 0
     fi
 
@@ -560,7 +587,7 @@ generate_fallback_certificate() {
     chmod 0644 "$FALLBACK_CERT"
     rm -rf -- "$temp_dir"
     CERT_CHANGED='yes'
-    printf 'Generated a fallback certificate for the selected IP addresses and discovered hostnames.\n'
+    printf 'Generated the active internal self-signed certificate for the selected IP addresses and discovered hostnames.\n'
 }
 
 validate_certificate_file() {
@@ -576,6 +603,107 @@ validate_private_key_file() {
 
     [[ -f "$key_file" && -r "$key_file" ]] || return 1
     openssl pkey -in "$key_file" -noout -passin pass: >/dev/null 2>&1
+}
+
+ensure_caddy_source_access() {
+    local file="$1"
+    local parent_directory
+
+    command -v setfacl >/dev/null 2>&1 || {
+        warn "ACL utilities are not installed; source-file ACL changes were skipped. The certificate will still be copied into Caddy's managed directory."
+        return 0
+    }
+    id caddy >/dev/null 2>&1 || {
+        warn "The caddy user does not exist yet; source-file ACL access will be applied after Caddy is installed."
+        return 0
+    }
+    command -v runuser >/dev/null 2>&1 ||
+        die "runuser is required to verify Caddy file access."
+
+    parent_directory="$(dirname -- "$file")"
+    while [[ "$parent_directory" != '/' ]]; do
+        if ! runuser -u caddy -- test -x "$parent_directory"; then
+            setfacl -m u:caddy:--x -- "$parent_directory" ||
+                die "Could not grant Caddy traverse access to $parent_directory."
+        fi
+        parent_directory="$(dirname -- "$parent_directory")"
+    done
+
+    setfacl -m u:caddy:r-- -- "$file" ||
+        die "Could not grant Caddy read access to $file."
+    runuser -u caddy -- test -r "$file" ||
+        die "ACL configuration completed, but Caddy still cannot read $file."
+    printf 'Verified Caddy read access: %s\n' "$file"
+}
+
+certificate_dns_names() {
+    local certificate="$1"
+
+    openssl x509 -in "$certificate" -noout -ext subjectAltName 2>/dev/null |
+        tr ',' '\n' |
+        sed -n 's/^[[:space:]]*DNS://p'
+}
+
+certificate_ip_addresses() {
+    local certificate="$1"
+
+    openssl x509 -in "$certificate" -noout -ext subjectAltName 2>/dev/null |
+        tr ',' '\n' |
+        sed -n 's/^[[:space:]]*IP Address://p'
+}
+
+certificate_covers_ip() {
+    local certificate="$1"
+    local wanted_ip="$2"
+    local certificate_ip
+
+    while IFS= read -r certificate_ip; do
+        [[ "$certificate_ip" == "$wanted_ip" ]] && return 0
+    done < <(certificate_ip_addresses "$certificate")
+    return 1
+}
+
+certificate_covers_hostname() {
+    local certificate="$1"
+    local wanted_hostname="${2,,}"
+    local certificate_name
+    local prefix
+    local suffix
+
+    while IFS= read -r certificate_name; do
+        certificate_name="${certificate_name,,}"
+        if [[ "$certificate_name" == "$wanted_hostname" ]]; then
+            return 0
+        fi
+        if [[ "$certificate_name" == \*.* ]]; then
+            suffix="${certificate_name#*.}"
+            if [[ "$wanted_hostname" == *."$suffix" ]]; then
+                prefix="${wanted_hostname%."$suffix"}"
+                [[ -n "$prefix" && "$prefix" != *.* ]] && return 0
+            fi
+        fi
+    done < <(certificate_dns_names "$certificate")
+    return 1
+}
+
+register_certificate_hostname() {
+    local hostname_value="$1"
+    local ip_address="$2"
+    local candidate
+    local index
+
+    for candidate in "${DISCOVERED_HOSTNAMES[@]}"; do
+        [[ "$candidate" == "$hostname_value" ]] && return 0
+    done
+    DISCOVERED_HOSTNAMES+=("$hostname_value")
+
+    for index in "${!SELECTED_IPS[@]}"; do
+        if [[ "${SELECTED_IPS[$index]}" == "$ip_address" &&
+              -z "${SELECTED_HOSTNAMES[$index]}" ]]; then
+            SELECTED_HOSTNAMES[$index]="$hostname_value"
+            break
+        fi
+    done
 }
 
 certificate_and_key_match() {
@@ -597,24 +725,82 @@ confirm_custom_certificate_coverage() {
     local covered=0
     local hostname_value
     local ip_address
+    local local_ip
+    local matched_ip
     local missing=0
+    local resolved_ip
+    local -a candidate_hostnames=()
+    local -a current_host_ips=()
+    local -a resolved_ips=()
+
+    while IFS= read -r local_ip; do
+        [[ -n "$local_ip" ]] && current_host_ips+=("$local_ip")
+    done < <(
+        ip -o -4 addr show scope global |
+            awk '{split($4, parts, "/"); print parts[1]}' |
+            sort -u
+    )
+
+    candidate_hostnames=("${DISCOVERED_HOSTNAMES[@]}")
+    while IFS= read -r hostname_value; do
+        [[ -n "$hostname_value" && "$hostname_value" != \** ]] || continue
+        local already_present='no'
+        local candidate
+        for candidate in "${candidate_hostnames[@]}"; do
+            [[ "$candidate" == "$hostname_value" ]] && already_present='yes'
+        done
+        [[ "$already_present" == 'yes' ]] || candidate_hostnames+=("$hostname_value")
+    done < <(certificate_dns_names "$certificate")
 
     printf '\nCertificate name coverage:\n'
+    openssl x509 -in "$certificate" -noout -subject -issuer -dates |
+        sed 's/^/  /'
+
     for ip_address in "${SELECTED_IPS[@]}"; do
-        if openssl x509 -in "$certificate" -noout -checkip "$ip_address" >/dev/null 2>&1; then
-            printf '  covered: %s\n' "$ip_address"
+        if certificate_covers_ip "$certificate" "$ip_address"; then
+            printf '  covered IP:      %s\n' "$ip_address"
             covered=$((covered + 1))
         else
-            printf '  MISSING: %s\n' "$ip_address"
+            printf '  not in cert IP:  %s\n' "$ip_address"
             missing=$((missing + 1))
         fi
     done
-    for hostname_value in "${DISCOVERED_HOSTNAMES[@]}"; do
-        if openssl x509 -in "$certificate" -noout -checkhost "$hostname_value" >/dev/null 2>&1; then
-            printf '  covered: %s\n' "$hostname_value"
+
+    for hostname_value in "${candidate_hostnames[@]}"; do
+        if ! certificate_covers_hostname "$certificate" "$hostname_value"; then
+            printf '  not in cert DNS: %s\n' "$hostname_value"
+            missing=$((missing + 1))
+            continue
+        fi
+
+        resolved_ips=()
+        while IFS= read -r resolved_ip; do
+            [[ -n "$resolved_ip" ]] && resolved_ips+=("$resolved_ip")
+        done < <(getent ahostsv4 "$hostname_value" 2>/dev/null |
+            awk '{print $1}' | sort -u)
+
+        if (( ${#resolved_ips[@]} == 0 )); then
+            warn "Certificate covers $hostname_value, but local DNS returned no IPv4 address."
+            missing=$((missing + 1))
+            continue
+        fi
+
+        matched_ip=''
+        for resolved_ip in "${resolved_ips[@]}"; do
+            for local_ip in "${current_host_ips[@]}"; do
+                if [[ "$resolved_ip" == "$local_ip" ]]; then
+                    matched_ip="$resolved_ip"
+                    break 2
+                fi
+            done
+        done
+
+        if [[ -n "$matched_ip" ]]; then
+            printf '  covered hostname: %s -> %s\n' "$hostname_value" "$matched_ip"
+            register_certificate_hostname "$hostname_value" "$matched_ip"
             covered=$((covered + 1))
         else
-            printf '  MISSING: %s\n' "$hostname_value"
+            warn "Certificate covers $hostname_value, but local DNS resolves it to [${resolved_ips[*]}], none of which are assigned to this host [${current_host_ips[*]}]."
             missing=$((missing + 1))
         fi
     done
@@ -635,21 +821,32 @@ collect_custom_certificate() {
     local path_value
 
     while true; do
-        read -r -p "Full path to certificate or PEM full chain [BACK]: " path_value
+        echo
+        read -r -p "Certificate Fullpath (enter BACK to return): " path_value
         [[ "${path_value^^}" == 'BACK' ]] && return 1
+        if [[ ! -f "$path_value" || ! -r "$path_value" ]]; then
+            warn "That certificate file does not exist or is not readable: $path_value"
+            continue
+        fi
         if ! validate_certificate_file "$path_value"; then
-            warn "That file is missing, unreadable, expired, or not a valid PEM X.509 certificate/full chain."
+            warn "That file is expired or is not a valid PEM X.509 certificate/full chain."
             continue
         fi
         CUSTOM_CERT_SOURCE="$path_value"
+        ensure_caddy_source_access "$CUSTOM_CERT_SOURCE"
         break
     done
 
     while true; do
-        read -r -p "Full path to the matching unencrypted private key [BACK]: " path_value
+        echo
+        read -r -p "Private key Fullpath (enter BACK to return): " path_value
         [[ "${path_value^^}" == 'BACK' ]] && return 1
+        if [[ ! -f "$path_value" || ! -r "$path_value" ]]; then
+            warn "That private-key file does not exist or is not readable: $path_value"
+            continue
+        fi
         if ! validate_private_key_file "$path_value"; then
-            warn "That file is missing, unreadable, encrypted, or not a valid PEM private key."
+            warn "That file is encrypted or is not a valid PEM private key."
             continue
         fi
         if ! certificate_and_key_match "$CUSTOM_CERT_SOURCE" "$path_value"; then
@@ -657,6 +854,7 @@ collect_custom_certificate() {
             continue
         fi
         CUSTOM_KEY_SOURCE="$path_value"
+        ensure_caddy_source_access "$CUSTOM_KEY_SOURCE"
         break
     done
 
@@ -677,12 +875,14 @@ choose_certificate_mode() {
     info "Select the HTTPS certificate"
     while true; do
         cat <<'EOF'
-1) Internal self-signed fallback certificate
+
+1) Internal self-signed certificate
 2) Another preinstalled certificate or PEM full chain and private key
 Q) Cancel and quit
 
 The certificate file may contain the leaf certificate plus intermediate chain.
 The private key is supplied separately and must be unencrypted.
+
 EOF
         read -r -p "Selection [$default_selection]: " selection
         selection="${selection:-$default_selection}"
@@ -817,12 +1017,22 @@ prepare_caddy_certificates() {
     getent group caddy >/dev/null 2>&1 ||
         die "The Caddy service group does not exist. Run --mode install first."
     install -d -o root -g caddy -m 0750 "$CERT_DIR"
-    chown root:caddy "$LOCAL_CA_CERT" "$FALLBACK_CERT" "$FALLBACK_LEAF_CERT" "$FALLBACK_KEY"
-    chmod 0644 "$LOCAL_CA_CERT" "$FALLBACK_CERT" "$FALLBACK_LEAF_CERT"
-    chmod 0640 "$FALLBACK_KEY"
-    chmod 0600 "$LOCAL_CA_KEY"
+
+    if [[ "$CERT_MODE" == 'self-signed' ]]; then
+        [[ -s "$LOCAL_CA_CERT" && -s "$LOCAL_CA_KEY" &&
+           -s "$FALLBACK_CERT" && -s "$FALLBACK_LEAF_CERT" &&
+           -s "$FALLBACK_KEY" ]] ||
+            die "The active internal certificate files are incomplete. Run certificate selection again."
+        chown root:caddy \
+            "$LOCAL_CA_CERT" "$FALLBACK_CERT" "$FALLBACK_LEAF_CERT" "$FALLBACK_KEY"
+        chmod 0644 "$LOCAL_CA_CERT" "$FALLBACK_CERT" "$FALLBACK_LEAF_CERT"
+        chmod 0640 "$FALLBACK_KEY"
+        chmod 0600 "$LOCAL_CA_KEY"
+    fi
 
     if [[ "$CERT_MODE" == 'custom' ]]; then
+        ensure_caddy_source_access "$CUSTOM_CERT_SOURCE"
+        ensure_caddy_source_access "$CUSTOM_KEY_SOURCE"
         if [[ ! -s "$CUSTOM_CERT" ]] || ! cmp -s "$CUSTOM_CERT_SOURCE" "$CUSTOM_CERT"; then
             install -o root -g caddy -m 0644 "$CUSTOM_CERT_SOURCE" "$CUSTOM_CERT"
             CERT_CHANGED='yes'
@@ -1015,26 +1225,52 @@ url_for() {
 }
 
 verify_caddy_proxy() {
+    local certificate_target=''
+    local hostname_value
     local ip_address="${SELECTED_IPS[0]}"
     local test_url
 
     info "Certifying direct and proxied Open WebUI access"
     verify_openwebui
 
-    test_url="$(url_for https "$ip_address" "$HTTPS_PORT" 443)"
     if [[ "$CERT_MODE" == 'self-signed' ]]; then
+        test_url="$(url_for https "$ip_address" "$HTTPS_PORT" 443)"
         if ! curl --fail --silent --show-error --max-time 30 \
             --cacert "$LOCAL_CA_CERT" --output /dev/null "$test_url/"; then
             verify_openwebui || true
             die "Direct Open WebUI works, but the Caddy HTTPS connection failed: $test_url"
         fi
     else
-        if ! curl --fail --silent --show-error --max-time 30 \
-            --insecure --output /dev/null "$test_url/"; then
-            verify_openwebui || true
-            die "Direct Open WebUI works, but the Caddy HTTPS connection failed: $test_url"
+        for hostname_value in "${DISCOVERED_HOSTNAMES[@]}"; do
+            if certificate_covers_hostname "$ACTIVE_CERT" "$hostname_value"; then
+                certificate_target="$hostname_value"
+                break
+            fi
+        done
+        if [[ -z "$certificate_target" ]]; then
+            for ip_address in "${SELECTED_IPS[@]}"; do
+                if certificate_covers_ip "$ACTIVE_CERT" "$ip_address"; then
+                    certificate_target="$ip_address"
+                    break
+                fi
+            done
         fi
-        warn "The custom-certificate connectivity test bypassed client trust validation; deploy the appropriate CA chain to clients."
+        if [[ -z "$certificate_target" ]]; then
+            certificate_target="${SELECTED_IPS[0]}"
+            warn "The custom certificate covers none of the recorded proxy names; only encrypted connectivity can be tested."
+        fi
+        test_url="$(url_for https "$certificate_target" "$HTTPS_PORT" 443)"
+        if ! curl --fail --silent --show-error --max-time 30 \
+            --output /dev/null "$test_url/"; then
+            warn "The HTTPS endpoint is reachable, but the local trust store may not trust the custom certificate; retrying connectivity without trust validation."
+            if ! curl --fail --silent --show-error --max-time 30 \
+                --insecure --output /dev/null "$test_url/"; then
+                verify_openwebui || true
+                die "Direct Open WebUI works, but the Caddy HTTPS connection failed: $test_url"
+            fi
+        else
+            printf 'Trusted custom-certificate endpoint verified: %s\n' "$test_url"
+        fi
     fi
 
     if [[ "$HTTP_ENABLED" == 'yes' ]]; then
@@ -1069,11 +1305,11 @@ record_state() {
     {
         printf 'PHASE=%q\n' 'caddy-open-webui'
         printf 'MODE=%q\n' "$MODE"
-        printf 'SELECTED_INTERFACES=%q\n' "$selected_interfaces"
-        printf 'SELECTED_IPS=%q\n' "$selected_ips"
+        printf 'SELECTED_INTERFACES=%s\n' "$selected_interfaces"
+        printf 'SELECTED_IPS=%s\n' "$selected_ips"
         printf 'BIND_MODE=%q\n' "$BIND_MODE"
-        printf 'BIND_VALUE=%q\n' "$BIND_VALUE"
-        printf 'REVERSE_HOSTNAMES=%q\n' "$host_pairs"
+        printf 'BIND_VALUE=%s\n' "$BIND_VALUE"
+        printf 'REVERSE_HOSTNAMES=%s\n' "$host_pairs"
         printf 'HTTPS_PORT=%q\n' "$HTTPS_PORT"
         printf 'HTTP_ENABLED=%q\n' "$HTTP_ENABLED"
         printf 'HTTP_PORT=%q\n' "$HTTP_PORT"
@@ -1107,9 +1343,14 @@ print_summary() {
     printf '\nHTTPS URLs:\n'
     for index in "${!SELECTED_IPS[@]}"; do
         ip_address="${SELECTED_IPS[$index]}"
-        printf '  %s\n' "$(url_for https "$ip_address" "$HTTPS_PORT" 443)"
+        if [[ "$CERT_MODE" == 'self-signed' ]] ||
+           certificate_covers_ip "$ACTIVE_CERT" "$ip_address"; then
+            printf '  %s\n' "$(url_for https "$ip_address" "$HTTPS_PORT" 443)"
+        fi
         hostname_value="${SELECTED_HOSTNAMES[$index]}"
         [[ -n "$hostname_value" ]] &&
+            { [[ "$CERT_MODE" == 'self-signed' ]] ||
+              certificate_covers_hostname "$ACTIVE_CERT" "$hostname_value"; } &&
             printf '  %s\n' "$(url_for https "$hostname_value" "$HTTPS_PORT" 443)"
     done
 
@@ -1124,9 +1365,11 @@ print_summary() {
         done
     fi
 
-    printf '\nFallback trust certificate:\n  %s\n' "$LOCAL_CA_CERT"
     if [[ "$CERT_MODE" == 'self-signed' ]]; then
+        printf '\nActive self-signed CA certificate:\n  %s\n' "$LOCAL_CA_CERT"
         printf 'Install that CA certificate on client devices to trust the HTTPS URLs.\n'
+    else
+        printf '\nActive external certificate:\n  %s\n' "$ACTIVE_CERT"
     fi
 
     cat <<EOF
@@ -1136,6 +1379,7 @@ Useful commands:
     sudo systemctl status caddy
     sudo journalctl -u caddy -f
     sudo ./$PROGRAM_NAME --mode certificate
+
 EOF
 }
 
@@ -1167,8 +1411,6 @@ if [[ "$MODE" == 'certificate' ]]; then
 
     if [[ "$CERT_MODE" == 'self-signed' ]]; then
         generate_fallback_certificate yes
-    else
-        generate_fallback_certificate
     fi
     prepare_caddy_certificates
     install_managed_route
@@ -1176,13 +1418,13 @@ if [[ "$MODE" == 'certificate' ]]; then
     verify_caddy_proxy
     record_state
     print_summary
+    echo
     exit 0
 fi
 
 detect_active_ipv4
 select_interfaces
 discover_reverse_hostnames
-generate_fallback_certificate
 configure_ports
 
 printf '\nFinal selections:\n'
@@ -1194,6 +1436,9 @@ printf '  HTTP enabled:     %s\n' "$HTTP_ENABLED"
 read -r -p "Apply this Caddy configuration? [y/N]: " final_confirmation
 yes_answer "$final_confirmation" || cancel
 
+if [[ "$CERT_MODE" == 'self-signed' ]]; then
+    generate_fallback_certificate
+fi
 install_caddy_and_certificates
 install_managed_route
 configure_firewall
